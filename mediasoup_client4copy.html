@@ -1,0 +1,526 @@
+<!DOCTYPE html>
+<html>
+<meta charset="UTF-8">
+<head>
+    <title>WebRTC with RNNoise (本地编译版)</title>
+    <style>
+        video {
+            width: 300px;
+            height: 225px;
+            margin: 10px;
+            background: #000;
+        }
+        #videoContainer {
+            display: flex;
+            flex-wrap: wrap;
+        }
+        button {
+            padding: 10px;
+            margin: 5px;
+            font-size: 16px;
+        }
+    </style>
+</head>
+<body>
+
+<button id="startCall">startCall</button>
+<button id="endCall" disabled>endCall</button>
+<br>
+<video id="localVideo" autoplay muted></video>
+<br>
+<div id="videoContainer"></div>
+<div id="audioContainer"></div>
+
+<script type="module">
+    // 导入本地编译的 RNNoise 模块（默认导出是一个 Promise）
+    import createRNNWasmModule from './lib/rnnoise.js';
+
+    // ---------- 封装一个 NoiseSuppressor 类，模拟官方 API ----------
+    class NoiseSuppressor {
+        constructor(audioContext) {
+            this.audioContext = audioContext;
+            this.rnn = null;
+            this.frameSize = 480;                 // RNNoise 要求的帧大小
+            this.bufferSize = 1024;               // ScriptProcessorNode 使用的 bufferSize (2 的幂)
+            this.inputFifo = [];                  // 输入样本 FIFO (Float32)
+            this.outputFifo = [];                 // 输出样本 FIFO (Float32)
+            this.processorNode = null;
+            this.destinationNode = null;
+            // 函数引用
+            this._rnnoise_init = null;
+            this._rnnoise_create = null;
+            this._rnnoise_process_frame = null;
+            this._rnnoise_destroy = null;
+            this._malloc = null;
+            this._free = null;
+            this.Module = null;
+        }
+
+        _bindFunctions(moduleObj) {
+            // 明确指定目标属性名和可能的源函数名
+            console.log('_bindFunctions 被调用，moduleObj =', moduleObj);
+            console.log('moduleObj 的属性名列表:', Object.keys(moduleObj));
+            const mappings = {
+                '_rnnoise_init': ['_rnnoise_init', 'rnnoise_init'],
+                '_rnnoise_create': ['_rnnoise_create', 'rnnoise_create'],
+                '_rnnoise_process_frame': ['_rnnoise_process_frame', 'rnnoise_process_frame'],
+                '_rnnoise_destroy': ['_rnnoise_destroy', 'rnnoise_destroy'],
+                '_rnnoise_malloc': ['_malloc', 'malloc'],
+                '_rnnoise_free': ['_free', 'free']
+            };
+            for (const [targetName, names] of Object.entries(mappings)) {
+                let found = null;
+                for (const name of names) {
+                    if (typeof moduleObj[name] === 'function') {
+                        console.log('name:', name);
+                        found = moduleObj[name];
+                        break;
+                    }
+                }
+                if (!found) {
+                    throw new Error(`找不到函数 ${names.join(' 或 ')}，请检查 rnnoise.js 是否正确编译并加载了 wasm。`);
+                }
+                this[targetName] = found;
+            }
+        }
+
+        async init(moduleExports) {
+            let Module = moduleExports;
+            if (Module.default && typeof Module.default === 'object') {
+                Module = Module.default;
+            }
+            if (typeof Module === 'function') {
+                Module = await Module();
+            }
+            if (Module.Module && typeof Module.Module === 'object') {
+                Module = Module.Module;
+            }
+            this.Module = Module;
+            this._bindFunctions(this.Module);
+
+            this._rnnoise_init();
+            this.rnn = this._rnnoise_create();
+
+            // 使用合法的 bufferSize (2 的幂)
+            this.processorNode = this.audioContext.createScriptProcessor(this.bufferSize, 1, 1);
+            this.processorNode.onaudioprocess = this.processAudio.bind(this);
+            this.destinationNode = this.audioContext.createMediaStreamDestination();
+            this.processorNode.connect(this.destinationNode);
+            return this;
+        }
+
+        processAudio(event) {
+            if (!this.rnn) return;
+            const input = event.inputBuffer.getChannelData(0);
+            const output = event.outputBuffer.getChannelData(0);
+            // 1. 将新输入追加到 FIFO
+            for (let i = 0; i < input.length; i++) {
+                this.inputFifo.push(input[i]);
+            }
+
+            // 2. 当 FIFO 中足够一个完整帧时，循环处理
+            const inPtr = this._rnnoise_malloc(this.frameSize * 4);
+            const outPtr = this._rnnoise_malloc(this.frameSize * 4);
+
+            while (this.inputFifo.length >= this.frameSize) {
+                // 取出 480 个样本
+                const inputFrame = this.inputFifo.splice(0, this.frameSize);
+                // 复制到 WASM 内存
+                this.Module.HEAPF32.set(inputFrame, inPtr / 4);
+                // 调用降噪处理
+                this._rnnoise_process_frame(this.rnn, outPtr, inPtr);
+                // 读取处理后的帧
+                const processedFrame = new Float32Array(this.Module.HEAPF32.buffer, outPtr, this.frameSize);
+                // 将输出样本推入输出 FIFO
+                console.log("process audio end and processedFrame length", processedFrame.length)
+                for (let i = 0; i < processedFrame.length; i++) {
+                    this.outputFifo.push(processedFrame[i]);
+                }
+            }
+
+            this._rnnoise_free(inPtr);
+            this._rnnoise_free(outPtr);
+
+            // 3. 从输出 FIFO 中取出本次回调需要的样本 (output.length)
+            const samplesNeeded = output.length;
+            if (this.outputFifo.length >= samplesNeeded) {
+                const outSamples = this.outputFifo.splice(0, samplesNeeded);
+                output.set(outSamples);
+            } else {
+                // 理论上不应该发生，如果发生则补零
+                console.warn('输出 FIFO 数据不足，补零');
+                output.fill(0);
+            }
+        }
+
+        get stream() {
+            return this.destinationNode ? this.destinationNode.stream : null;
+        }
+
+        destroy() {
+            if (this.rnn && this._rnnoise_destroy) {
+                this._rnnoise_destroy(this.rnn);
+                this.rnn = null;
+            }
+            if (this.processorNode) {
+                this.processorNode.disconnect();
+                this.processorNode = null;
+            }
+            if (this.destinationNode) {
+                this.destinationNode.disconnect();
+                this.destinationNode = null;
+            }
+            this.inputFifo = [];
+            this.outputFifo = [];
+        }
+
+    }
+
+    // ---------- 原有 WebRTC 逻辑，适配新的 NoiseSuppressor ----------
+    const userId = "" + Math.floor(Math.random() * 10000);
+    let heartbeatInterval;
+    let localRawStream;      // 原始音视频流 (用于显示本地视频)
+    let localStream;         // 实际发送的流 (降噪后的音频 + 原始视频)
+    let peerConnection;
+    let consumerPeerConnection;
+    let isCaller = false;
+
+    // RNNoise 相关全局变量
+    let audioContext = null;
+    let sourceNode = null;
+    let denoiserNode = null;
+    let denoiseInitialized = false;
+
+    const configuration = {
+        iceServers: [
+            { urls: 'stun:stun.l.google.com:19302' },
+        ]
+    };
+    const signalingServer = new WebSocket('ws://localhost:8080/ws');
+
+    // 1. 获取原始媒体流
+    async function getOriginalMedia() {
+        try {
+            localRawStream = await navigator.mediaDevices.getUserMedia({
+                video: true,
+                audio: {
+                    echoCancellation: true,      // 启用回声消除 (AEC)
+                    noiseSuppression: true,      // 启用噪声抑制 (ANS)
+                    autoGainControl: true        // 启用自动增益控制 (AGC)
+                }
+            });
+            document.getElementById('localVideo').srcObject = localRawStream;
+            localStream = localRawStream;
+        } catch (err) {
+            console.error('获取媒体设备失败:', err);
+            alert('无法访问摄像头/麦克风，请检查权限设置');
+        }
+    }
+
+    // 2. 初始化 RNNoise 降噪（使用本地封装的 NoiseSuppressor）
+    async function setupDenoise() {
+        if (denoiseInitialized && audioContext && audioContext.state !== 'closed') {
+            return true;
+        }
+
+        try {
+            // 等待本地 WASM 模块加载完成
+            const moduleFactory = await createRNNWasmModule;
+            const Module = await moduleFactory();
+            // 现在 Module 包含 _rnnoise_init / rnnoise_create 等函数
+            console.log('Module 对象:', Module);
+            console.log('是否有 _rnnoise_init?', '_rnnoise_init' in Module);
+            // 创建 AudioContext
+            audioContext = new AudioContext();
+            // 创建 MediaStreamSource
+            sourceNode = audioContext.createMediaStreamSource(localRawStream);
+
+            // 创建自定义降噪节点
+            denoiserNode = new NoiseSuppressor(audioContext);
+            await denoiserNode.init(Module);
+
+            // 连接：原始音频 -> 降噪处理器 -> (无直接输出，内部已连接到 destination)
+            sourceNode.connect(denoiserNode.processorNode);
+
+            // 启动 AudioContext
+            if (audioContext.state === 'suspended') {
+                await audioContext.resume();
+            }
+
+            // 获取降噪后的音频流
+            const denoisedAudioStream = denoiserNode.stream;
+            const videoTrack = localRawStream.getVideoTracks()[0];
+            const audioTrack = denoisedAudioStream.getAudioTracks()[0];
+
+            if (!audioTrack) {
+                throw new Error('无法获取降噪后的音频轨道');
+            }
+
+            const newStream = new MediaStream();
+            if (videoTrack) newStream.addTrack(videoTrack);
+            newStream.addTrack(audioTrack);
+
+            localStream = newStream;
+            denoiseInitialized = true;
+            console.log('本地编译版 RNNoise 降噪已启动，音频轨道替换成功, denoiseInitialized: ', denoiseInitialized);
+            return true;
+        } catch (err) {
+            console.error('初始化本地 RNNoise 降噪失败，将使用原始音频:', err);
+            localStream = localRawStream;
+            denoiseInitialized = false;
+            return false;
+        }
+    }
+
+    function closeDenoise() {
+        if (denoiserNode) {
+            denoiserNode.destroy();
+            denoiserNode = null;
+        }
+        if (sourceNode) {
+            sourceNode.disconnect();
+            sourceNode = null;
+        }
+        if (audioContext) {
+            audioContext.close().catch(e => console.warn('关闭 AudioContext 失败', e));
+            audioContext = null;
+        }
+        denoiseInitialized = false;
+    }
+    function clearMediaContainers() {
+        while (videoContainer.firstChild) {
+            videoContainer.removeChild(videoContainer.firstChild);
+        }
+        while (audioContainer.firstChild) {
+            audioContainer.removeChild(audioContainer.firstChild);
+        }
+    }
+
+    function startHeartbeat() {
+        if (heartbeatInterval) clearInterval(heartbeatInterval);
+        heartbeatInterval = setInterval(() => {
+            if (signalingServer.readyState === WebSocket.OPEN) {
+                signalingServer.send(JSON.stringify({ type: "heatBeat" }));
+                console.log("心跳包已发送");
+            } else {
+                console.warn("无法发送心跳: WebSocket连接未打开");
+            }
+        }, 900);
+    }
+
+    function stopHeartbeat() {
+        if (heartbeatInterval) {
+            clearInterval(heartbeatInterval);
+            heartbeatInterval = null;
+            console.log("心跳已停止");
+        }
+    }
+
+    function createPeerConnection() {
+        peerConnection = new RTCPeerConnection(configuration);
+        peerConnection.oniceconnectionstatechange = () => {
+            console.log('ICE连接状态:', peerConnection.iceConnectionState);
+            if (peerConnection.iceConnectionState === 'failed' ||
+                peerConnection.iceConnectionState === 'disconnected') {
+                restartIce();
+            }
+        };
+        // 添加本地流（仅在发起方时添加，且使用当前的 localStream）
+        if (isCaller && localStream) {
+            localStream.getTracks().forEach(track => {
+                peerConnection.addTrack(track, localStream);
+            });
+        }
+    }
+
+    function createConsumePeerConnection() {
+        consumerPeerConnection = new RTCPeerConnection(configuration);
+    }
+
+    function restartIce() {
+        if (peerConnection) {
+            peerConnection.restartIce();
+            if (isCaller) {
+                createOffer();
+            }
+        }
+        if (consumerPeerConnection) {
+            consumerPeerConnection.restartIce();
+            // 非发起方不需要主动创建 offer
+        }
+    }
+
+    async function createOffer() {
+        try {
+            const offer = await peerConnection.createOffer({
+                offerToReceiveAudio: false,
+                offerToReceiveVideo: false
+            });
+            await peerConnection.setLocalDescription(offer);
+            signalingServer.send(JSON.stringify({
+                type: 'offer',
+                roomId: 'lsk01',
+                userId: userId,
+                offer: peerConnection.localDescription
+            }));
+        } catch (err) {
+            console.error('创建Offer失败:', err);
+        }
+    }
+
+    // 发起通话按钮
+    document.getElementById('startCall').addEventListener('click', async () => {
+        // 关键：在用户手势下初始化 RNNoise 降噪
+        await setupDenoise();
+
+        isCaller = true;
+        document.getElementById('startCall').disabled = true;
+        document.getElementById('endCall').disabled = false;
+
+        if (!peerConnection) createPeerConnection();
+        await createOffer();
+    });
+
+    // 挂断按钮
+    document.getElementById('endCall').addEventListener('click', () => {
+        if (peerConnection) {
+            peerConnection.close();
+            peerConnection = null;
+        }
+        if (consumerPeerConnection) {
+            consumerPeerConnection.close();
+            consumerPeerConnection = null;
+        }
+        // 关闭降噪资源
+        closeDenoise();
+
+        document.getElementById('startCall').disabled = false;
+        document.getElementById('endCall').disabled = true;
+        // 注意：原代码中有 remoteVideo 元素不存在，此处移除无效调用
+        signalingServer.send(JSON.stringify({
+            type: 'hangup',
+            roomId: 'lsk01',
+            userId: userId
+        }));
+    });
+
+    // 处理信令消息
+    signalingServer.onmessage = async (event) => {
+        const message = JSON.parse(event.data);
+        console.log('收到信令消息:', message);
+
+        if (message.type === 'hangup') {
+            if (peerConnection) {
+                peerConnection.close();
+                peerConnection = null;
+            }
+            if (consumerPeerConnection) {
+                consumerPeerConnection.close();
+                consumerPeerConnection = null;
+            }
+            closeDenoise();
+            document.getElementById('startCall').disabled = false;
+            document.getElementById('endCall').disabled = true;
+            return;
+        }
+
+        // 被叫方收到 offer 时，需要确保本地降噪已初始化
+        if (message.type === 'offer' && !denoiseInitialized && localRawStream) {
+            console.log('被叫方尝试初始化降噪...');
+            await setupDenoise();  // 注意：这里可能因自动播放策略失败，失败时 localStream 仍为原始流
+        }
+
+        if (!peerConnection) {
+            createPeerConnection();
+            // 如果是被叫方，添加本地流（使用当前的 localStream）
+            if (localStream) {
+                localStream.getTracks().forEach(track => {
+                    peerConnection.addTrack(track, localStream);
+                });
+            }
+        }
+
+        try {
+            switch (message.type) {
+                case 'offer':
+                    if (consumerPeerConnection) {
+                        consumerPeerConnection.close();
+                        consumerPeerConnection = null;
+                    }
+                    createConsumePeerConnection();
+                    consumerPeerConnection.oniceconnectionstatechange = () => {
+                        console.log('Consumer ICE连接状态:', consumerPeerConnection.iceConnectionState);
+                        if (consumerPeerConnection.iceConnectionState === 'failed' ||
+                            consumerPeerConnection.iceConnectionState === 'disconnected') {
+                            restartIce();
+                        }
+                    };
+                    consumerPeerConnection.ontrack = (event) => {
+                        const track = event.track;
+                        const stream = new MediaStream([track]);
+                        const container = track.kind === 'video' ? videoContainer : audioContainer;
+                        const mediaElement = track.kind === 'video' ? document.createElement('video') : document.createElement('audio');
+                        mediaElement.autoplay = true;
+                        mediaElement.srcObject = stream;
+                        if (track.kind === 'video') {
+                            mediaElement.playsInline = true;
+                        } else {
+                            mediaElement.controls = true;
+                        }
+                        container.appendChild(mediaElement);
+                    };
+                    await clearMediaContainers();
+                    await consumerPeerConnection.setRemoteDescription(message.offer);
+                    const answer = await consumerPeerConnection.createAnswer();
+                    await consumerPeerConnection.setLocalDescription(answer);
+                    signalingServer.send(JSON.stringify({
+                        type: 'answer',
+                        roomId: 'lsk01',
+                        userId: userId,
+                        answer: consumerPeerConnection.localDescription
+                    }));
+                    document.getElementById('endCall').disabled = false;
+                    break;
+
+                case 'answer':
+                    await peerConnection.setRemoteDescription(message.answer);
+                    break;
+
+                case 'candidate':
+                    try {
+                        await peerConnection.addIceCandidate(new RTCIceCandidate(message.candidate));
+                    } catch (err) {
+                        console.error('添加ICE候选失败:', err);
+                    }
+                    break;
+                case 'heatBeat':
+                    console.log("heatBeat rec success");
+                    break;
+            }
+        } catch (err) {
+            console.error('处理信令消息失败:', err);
+        }
+    };
+
+    // 初始化：获取原始媒体，不开启降噪（降噪需要用户手势）
+    async function init() {
+        await getOriginalMedia();
+        document.getElementById('startCall').disabled = false;
+
+        signalingServer.onopen = () => {
+            console.log('已连接到信令服务器');
+        };
+        startHeartbeat();
+        signalingServer.onerror = (err) => {
+            console.error('信令服务器错误:', err);
+            stopHeartbeat();
+        };
+        signalingServer.onclose = () => {
+            console.log('信令服务器连接关闭');
+        };
+    }
+
+    init();
+</script>
+</body>
+</html>

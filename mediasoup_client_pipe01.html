@@ -1,0 +1,94 @@
+// ... 原有代码（userId，configuration，WebSocket 连接）保持不变 ...
+
+let audioContext = null; // 新增：用于管理音频上下文
+let isRnnoiseEnabled = false; // 新增：降噪开关状态
+
+// 1. UI: 在页面中添加一个控制按钮
+const rnnoiseToggle = document.createElement('button');
+rnnoiseToggle.id = 'toggleRnnoise';
+rnnoiseToggle.textContent = '🎤 启用 RNNoise 降噪 (真AI)';
+document.querySelector('.controls').appendChild(rnnoiseToggle);
+
+// 2. 创建音频处理管道的函数
+async function setupRnnoisePipeline(sourceStream) {
+    // 如果已经存在降噪管道，则先关闭它
+    if (audioContext) await audioContext.close();
+    
+    // 创建一个新的 AudioContext
+    audioContext = new AudioContext({ sampleRate: 48000 }); // 1. RNNoise 建议使用 48kHz 采样率[reference:14]
+    
+    // 2. 注册我们的 AudioWorklet 处理器
+    await audioContext.audioWorklet.addModule('path/to/noise-suppressor-worklet.js'); // 确保路径正确
+    
+    // 3. 创建 AudioWorkletNode
+    const noiseSuppressorNode = new AudioWorkletNode(audioContext, 'noise-suppressor-processor'); // 这与 worklet 中 registerProcessor 的名字对应[reference:15]
+    
+    // 4. 将原始麦克风流连接到降噪节点
+    const source = audioContext.createMediaStreamSource(sourceStream);
+    source.connect(noiseSuppressorNode);
+    
+    // 5. 创建一个目标，用于从处理后的节点获取新的 MediaStream
+    const destination = audioContext.createMediaStreamDestination();
+    noiseSuppressorNode.connect(destination);
+    
+    // 6. 返回处理后的新音频流
+    return destination.stream;
+}
+
+// 3. 替换音频轨道的函数
+async function replaceAudioTrackWithRnnoise() {
+    if (!isRnnoiseEnabled || !localStream) return;
+
+    try {
+        // 获取经过 RNNoise 处理的新音频流
+        const processedStream = await setupRnnoisePipeline(localStream);
+        const newAudioTrack = processedStream.getAudioTracks()[0];
+        
+        // 获取 peerConnection 中原有的音频发送器（sender）
+        const audioSender = peerConnection?.getSenders().find(s => s.track && s.track.kind === 'audio');
+        if (audioSender) {
+            // 替换音频轨道[reference:16]
+            await audioSender.replaceTrack(newAudioTrack);
+            console.log('✅ 已替换为 RNNoise 降噪音频轨道');
+        }
+        
+        // 保存新轨道引用以便后续停止
+        if (window.__oldAudioTrack) window.__oldAudioTrack.stop();
+        window.__oldAudioTrack = newAudioTrack;
+        
+        // 可选: 更新本地预览以测试效果
+        if (localVideoEl.srcObject) {
+            const newPreviewStream = new MediaStream([localVideoEl.srcObject.getVideoTracks()[0], newAudioTrack]);
+            localVideoEl.srcObject = newPreviewStream;
+        }
+        
+        // 刷新 localStream 引用，以便可能的重新协商
+        localStream = new MediaStream([localStream.getVideoTracks()[0], newAudioTrack]);
+        
+    } catch (error) {
+        console.error('启用 RNNoise 降噪失败，将使用原始音频', error);
+        isRnnoiseEnabled = false;
+        rnnoiseToggle.textContent = '🎤 启用 RNNoise 降噪 (真AI)';
+        rnnoiseToggle.style.background = '#2e4a6d';
+    }
+}
+
+// 4. 监听 RNNoise 按钮点击
+rnnoiseToggle.addEventListener('click', async () => {
+    isRnnoiseEnabled = !isRnnoiseEnabled;
+    if (isRnnoiseEnabled) {
+        rnnoiseToggle.textContent = '🔇 禁用 RNNoise 降噪';
+        rnnoiseToggle.style.background = '#1f6d49';
+        await replaceAudioTrackWithRnnoise();
+    } else {
+        rnnoiseToggle.textContent = '🎤 启用 RNNoise 降噪 (真AI)';
+        rnnoiseToggle.style.background = '#2e4a6d';
+        // 恢复原始音频轨道（从 localStream 获取）
+        const originalAudioTrack = localStream.getAudioTracks()[0];
+        const audioSender = peerConnection?.getSenders().find(s => s.track && s.track.kind === 'audio');
+        if (audioSender && originalAudioTrack) {
+            await audioSender.replaceTrack(originalAudioTrack);
+        }
+        if (audioContext) await audioContext.close();
+    }
+});

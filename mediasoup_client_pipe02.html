@@ -1,0 +1,312 @@
+<!DOCTYPE html>
+<html>
+<meta charset="UTF-8">
+<head>
+    <title>WebRTC</title>
+    <style>
+        video {
+            width: 300px;
+            height: 225px;
+            margin: 10px;
+            background: #000;
+        }
+        #videoContainer {
+            display: flex;
+            flex-wrap: wrap;
+        }
+        button {
+            padding: 10px;
+            margin: 5px;
+            font-size: 16px;
+        }
+    </style>
+</head>
+<body>
+
+<button id="startCall">startCall</button>
+<button id="endCall" disabled>endCall</button>
+<br>
+<video id="localVideo" autoplay muted></video>
+<br>
+<div id="videoContainer"></div>
+<div id="audioContainer"></div>
+
+<script>
+    const userId = "" + Math.floor(Math.random() * 10000);
+    // const userId = "563463"
+    let heartbeatInterval;
+    let localStream;
+    let peerConnection;
+    let consumerPeerConnection;
+    let isCaller = false;
+    const configuration = {
+        iceServers: [
+            { urls: 'stun:stun.l.google.com:19302' },
+        ]
+    };
+    const signalingServer = new WebSocket('ws://localhost:8080/ws');
+
+    // 获取本地媒体流
+    async function getMedia() {
+        try {
+            localStream = await navigator.mediaDevices.getUserMedia({
+                video: true,
+                audio: true
+            });
+            document.getElementById('localVideo').srcObject = localStream;
+        } catch (err) {
+            console.error('获取媒体设备失败:', err);
+            alert('无法访问摄像头/麦克风，请检查权限设置');
+        }
+    }
+    function clearMediaContainers() {
+        // 清理视频容器
+        while (videoContainer.firstChild) {
+            videoContainer.removeChild(videoContainer.firstChild);
+        }
+
+        // 清理音频容器
+        while (audioContainer.firstChild) {
+            audioContainer.removeChild(audioContainer.firstChild);
+        }
+    }
+    // 发送心跳包
+    function startHeartbeat() {
+        // 清除已有定时器
+        if (heartbeatInterval) clearInterval(heartbeatInterval);
+
+        // 每秒发送一次心跳
+        heartbeatInterval = setInterval(() => {
+            if (signalingServer.readyState === WebSocket.OPEN) {
+                signalingServer.send(JSON.stringify({
+                    type: "heatBeat"
+                }));
+            } else {
+                console.warn("无法发送心跳: WebSocket连接未打开");
+            }
+        }, 900);
+    }
+    // 停止心跳
+    function stopHeartbeat() {
+        if (heartbeatInterval) {
+            clearInterval(heartbeatInterval);
+            heartbeatInterval = null;
+            console.log("心跳已停止");
+        }
+    }
+
+    // 初始化 PeerConnection
+    function createPeerConnection() {
+        peerConnection = new RTCPeerConnection(configuration);
+
+        // 添加ICE状态监听
+        peerConnection.oniceconnectionstatechange = () => {
+            console.log('ICE连接状态:', peerConnection.iceConnectionState);
+            if (peerConnection.iceConnectionState === 'failed' ||
+                peerConnection.iceConnectionState === 'disconnected') {
+                restartIce();
+            }
+        };
+
+        // 添加本地流（仅在发起方时添加）
+        if (isCaller) {
+            localStream.getTracks().forEach(track => {
+                peerConnection.addTrack(track, localStream);
+            });
+        }
+    }
+
+    function createConsumePeerConnection(){
+        consumerPeerConnection = new RTCPeerConnection(configuration);
+        // 添加消费流ICE状态监听
+    }
+
+
+    // 重启ICE
+    function restartIce() {
+        if (peerConnection) {
+            peerConnection.restartIce();
+            if (isCaller) {
+                createOffer();
+            }
+        }
+        if (consumerPeerConnection) {
+            consumerPeerConnection.restartIce();
+            if (isCaller) {
+                createOffer();
+            }
+        }
+    }
+
+    // 创建Offer
+    async function createOffer() {
+        try {
+            const offer = await peerConnection.createOffer({
+                offerToReceiveAudio: false,
+                offerToReceiveVideo: false
+            });
+            await peerConnection.setLocalDescription(offer);
+            signalingServer.send(JSON.stringify({
+                type: 'offer_pipe_02',
+                roomId: 'lsk01pipe02',
+                userId: userId,
+                offer: peerConnection.localDescription
+            }));
+        } catch (err) {
+            console.error('创建Offer失败:', err);
+        }
+    }
+
+    // 发起通话按钮
+    document.getElementById('startCall').addEventListener('click', async () => {
+        isCaller = true;
+        document.getElementById('startCall').disabled = true;
+        document.getElementById('endCall').disabled = false;
+        if (!peerConnection) createPeerConnection();
+        await createOffer();
+    });
+
+    // 挂断按钮
+    document.getElementById('endCall').addEventListener('click', () => {
+        if (peerConnection) {
+            peerConnection.close();
+            peerConnection = null;
+        }
+        if (consumerPeerConnection) {
+            consumerPeerConnection.close();
+            consumerPeerConnection = null;
+        }
+        document.getElementById('startCall').disabled = false;
+        document.getElementById('endCall').disabled = true;
+        document.getElementById('remoteVideo').srcObject = null;
+        signalingServer.send(JSON.stringify({
+            type: 'hangup',
+            roomId: 'lsk01pipe02',
+            userId: userId
+        }));
+    });
+
+    // 处理信令消息
+    signalingServer.onmessage = async (event) => {
+        const message = JSON.parse(event.data);
+        // console.log('收到信令消息:', message);
+
+        if (message.type === 'hangup') {
+            if (peerConnection) {
+                peerConnection.close();
+                peerConnection = null;
+                consumerPeerConnection.close();
+                consumerPeerConnection = null
+            }
+            document.getElementById('startCall').disabled = false;
+            document.getElementById('endCall').disabled = true;
+            document.getElementById('remoteVideo').srcObject = null;
+            return;
+        }
+
+        if (!peerConnection) {
+            createPeerConnection();
+            // 如果是被叫方，添加本地流
+            localStream.getTracks().forEach(track => {
+                peerConnection.addTrack(track, localStream);
+            });
+        }
+
+        try {
+            switch (message.type) {
+                case 'offer':
+                    console.log("offer detail :", message.offer)
+                    if(consumerPeerConnection){
+                        consumerPeerConnection.close();
+                        consumerPeerConnection = null
+                    }
+                    createConsumePeerConnection()
+                    consumerPeerConnection.oniceconnectionstatechange = () => {
+                        console.log('Consumer ICE连接状态:', consumerPeerConnection.iceConnectionState);
+                        if (consumerPeerConnection.iceConnectionState === 'failed' ||
+                            consumerPeerConnection.iceConnectionState === 'disconnected') {
+                            restartIce();
+                        }
+                    };
+                    // 处理远程流
+                    // 修改ontrack事件处理
+                    consumerPeerConnection.ontrack = (event) => {
+                        const track = event.track;
+                        const stream = new MediaStream([track]);
+
+                        // 根据流类型创建元素
+                        const container = track.kind === 'video'
+                            ? videoContainer
+                            : audioContainer;
+
+                        const mediaElement = track.kind === 'video'
+                            ? document.createElement('video')
+                            : document.createElement('audio');
+
+                        mediaElement.autoplay = true;
+                        mediaElement.srcObject = stream;
+                        if (track.kind === 'video') {
+                            mediaElement.playsInline = true;
+                        } else {
+                            mediaElement.controls = true;
+                        }
+                        container.appendChild(mediaElement);
+                    };
+                    await clearMediaContainers()
+                    await consumerPeerConnection.setRemoteDescription(message.offer);
+                    const answer = await consumerPeerConnection.createAnswer();
+                    await consumerPeerConnection.setLocalDescription(answer);
+                    signalingServer.send(JSON.stringify({
+                        type: 'answer_pipe_02',
+                        roomId: 'lsk01pipe02',
+                        userId: userId,
+                        answer: consumerPeerConnection.localDescription
+                    }));
+                    console.log('answer', consumerPeerConnection.localDescription)
+                    document.getElementById('endCall').disabled = false;
+                    break;
+
+                case 'answer':
+                    await peerConnection.setRemoteDescription(message.answer);
+                    break;
+
+                case 'candidate':
+                    try {
+                        await peerConnection.addIceCandidate(new RTCIceCandidate(message.candidate));
+                    } catch (err) {
+                        console.error('添加ICE候选失败:', err);
+                    }
+                    break;
+                case 'heatBeat':
+
+                    break;
+            }
+        } catch (err) {
+            console.error('处理信令消息失败:', err);
+        }
+    };
+
+    // 初始化
+    async function init() {
+        await getMedia();
+        document.getElementById('startCall').disabled = false;
+
+        // 信令服务器连接状态处理
+        signalingServer.onopen = () => {
+            console.log('已连接到信令服务器');
+        };
+        startHeartbeat();
+        signalingServer.onerror = (err) => {
+            console.error('信令服务器错误:', err);
+            stopHeartbeat();
+        };
+
+        signalingServer.onclose = () => {
+            console.log('信令服务器连接关闭');
+        };
+    }
+
+    init();
+</script>
+</body>
+</html>
