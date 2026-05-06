@@ -14,16 +14,16 @@ static constexpr int PayloadProducerChannelFd{ 6 };
 int main(int argc, char* argv[])
 {
 	// Ensure we are called by our Node library.
-	if (!std::getenv("MEDIASOUP_VERSION"))
-	{
-		MS_ERROR_STD("you don't seem to be my real father!");
+    //	if (!std::getenv("MEDIASOUP_VERSION"))
+    //	{
+    //		MS_ERROR_STD("you don't seem to be my real father!");
+    //
+    //		// 41 is a custom exit code to notify about "missing MEDIASOUP_VERSION" env.
+    //		std::_Exit(41);
+    //	}
 
-		// 41 is a custom exit code to notify about "missing MEDIASOUP_VERSION" env.
-		std::_Exit(41);
-	}
-
-	const std::string version = std::getenv("MEDIASOUP_VERSION");
-
+    //	const std::string version = std::getenv("MEDIASOUP_VERSION");
+    const std::string version = "3.12.16"
 	auto statusCode = mediasoup_worker_run(
 	  argc,
 	  argv,
